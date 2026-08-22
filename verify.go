@@ -214,6 +214,9 @@ func parsePayload(config Config, jsonText string, expectedChallenge string, now 
 	if response.TerminationMessage, err = optionalString("termination_message"); err != nil {
 		return Response{}, payloadError(err)
 	}
+	if response.SsoURL, err = optionalString("sso_url"); err != nil {
+		return Response{}, payloadError(err)
+	}
 	if response.InvisibleFolderToken, err = optionalString("invisible_folder_token"); err != nil {
 		return Response{}, payloadError(err)
 	}

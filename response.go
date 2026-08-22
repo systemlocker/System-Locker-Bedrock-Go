@@ -12,6 +12,7 @@ const (
 	CodeInvalidRequest
 	CodeInvalidSystem
 	CodeInvalidCredentials
+	CodeGoogleSsoRequired
 	CodeUserNotVerified
 	CodeInvalidKey
 	CodeKeyFrozen
@@ -43,6 +44,7 @@ var codeNames = map[ResponseCode]string{
 	CodeInvalidRequest:            "INVALID_REQUEST",
 	CodeInvalidSystem:             "INVALID_SYSTEM",
 	CodeInvalidCredentials:        "INVALID_CREDENTIALS",
+	CodeGoogleSsoRequired:         "GOOGLE_SSO_REQUIRED",
 	CodeUserNotVerified:           "USER_NOT_VERIFIED",
 	CodeInvalidKey:                "INVALID_KEY",
 	CodeKeyFrozen:                 "KEY_FROZEN",
@@ -142,6 +144,7 @@ type Response struct {
 	LicenseKeyHash       string // empty when absent
 	UsernameHash         string // empty when absent
 	TerminationMessage   string // empty when absent
+	SsoURL               string // Google SSO portal URL, on GOOGLE_SSO_REQUIRED denials
 	InvisibleFolderToken string // empty when absent
 
 	// Variables holds the requested server-side variables, by name.
