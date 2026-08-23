@@ -3,6 +3,7 @@ package bedrock
 import (
 	"context"
 	"github.com/systemlocker/system-locker-bedrock-go/hwid"
+	"github.com/systemlocker/system-locker-bedrock-go/slhwid"
 	"net/url"
 	"strconv"
 	"strings"
@@ -52,9 +53,23 @@ type Client struct {
 	mutex   sync.Mutex
 	session *session
 	hook    func(HeartbeatFailure)
+	slhwid  map[string]SLHwidSession
 
 	// now is swappable (validation uses a frozen clock).
 	now func() time.Time
+}
+
+// SLHwidSession is the slice of slhwid.Session the client needs; the indirection
+// keeps the module swappable in tests without exposing test hooks publicly.
+type SLHwidSession interface {
+	HWID() string
+	Commit() error
+}
+
+// slHwidPrepare is swappable so tests can drive the secret-sharing module
+// without touching real hardware or storage.
+var slHwidPrepare = func(opts slhwid.Options) (SLHwidSession, error) {
+	return slhwid.Prepare(opts)
 }
 
 // Option customizes NewClient.
@@ -69,7 +84,14 @@ func WithHTTPClient(http HTTPClient) Option {
 // NewClient validates the configuration and returns a ready Client. The
 // validation errors mirror the protocol specification exactly.
 func NewClient(config Config, options ...Option) (*Client, error) {
-	if config.HWID == "" {
+	if config.HWIDMode != "" && config.HWIDMode != "legacy" && config.HWIDMode != "sl-hwid" {
+		return nil, fail(ErrConfiguration, "HWIDMode must be \"legacy\" or \"sl-hwid\".")
+	}
+	// An explicit HWID always wins. With an empty HWID, "legacy" derives the
+	// pre-1.0 hardware hash eagerly; "sl-hwid" (the default since
+	// 1.0.0) defers to the SL-HWID module at authentication time, because it
+	// is keyed by the authenticating identity.
+	if config.HWID == "" && config.HWIDMode == "legacy" {
 		derived, err := hwid.DeviceHWID()
 		if err != nil {
 			return nil, fail(ErrConfiguration, "Could not derive the default hardware ID: %v. Supply a custom HWID or use \"1\" to disable device checks.", err)
@@ -154,8 +176,18 @@ func (c *Client) authenticate(ctx context.Context, fields url.Values, identity s
 		return AuthenticationResult{}, err
 	}
 
+	hwidValue := c.config.HWID
+	var ssSession SLHwidSession
+	if hwidValue == "" { // secret_sharing mode: recover or enroll at auth time
+		ssSession, err = c.prepareSecretSharing(identity)
+		if err != nil {
+			return AuthenticationResult{}, err
+		}
+		hwidValue = ssSession.HWID()
+	}
+
 	fields.Set("system", c.config.SystemID)
-	fields.Set("hwid", c.config.HWID)
+	fields.Set("hwid", hwidValue)
 	fields.Set("version", c.config.Version)
 	fields.Set("beatrate", strconv.Itoa(int(c.config.BeatRate/time.Second)))
 	fields.Set("challenge", challenge)
@@ -214,6 +246,13 @@ func (c *Client) authenticate(ctx context.Context, fields url.Values, identity s
 		return AuthenticationResult{}, fail(ErrInvalidPayload, "Bedrock response identity hash does not match the authentication request.")
 	}
 
+	// The server accepted this identity on this device: re-center the
+	// secret-sharing shares on the hardware observed this launch. Failures
+	// are non-fatal — the next launch re-derives.
+	if ssSession != nil {
+		_ = ssSession.Commit()
+	}
+
 	c.mutex.Lock()
 	previous := c.session
 	c.mutex.Unlock()
@@ -242,6 +281,28 @@ func (c *Client) signedHeaders() map[string]string {
 		return nil
 	}
 	return map[string]string{"X-Bedrock-Key-Id": c.config.SigningKeyID}
+}
+
+// prepareSecretSharing recovers (or enrolls) the §4A module's HWID for the
+// identity, caching one session per identity.
+func (c *Client) prepareSecretSharing(identity string) (SLHwidSession, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.slhwid == nil {
+		c.slhwid = map[string]SLHwidSession{}
+	}
+	if cached, ok := c.slhwid[identity]; ok {
+		return cached, nil
+	}
+	session, err := slHwidPrepare(slhwid.Options{
+		StorePath:      c.config.SLHwidStore,
+		ExtraMandatory: c.config.SLHwidExtraMandatory,
+	})
+	if err != nil {
+		return nil, fail(ErrLocalFailure, "Secret-sharing HWID unavailable: %v", err)
+	}
+	c.slhwid[identity] = session
+	return session, nil
 }
 
 // HeartbeatNow performs one manual heartbeat. Requires a live session.

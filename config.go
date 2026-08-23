@@ -24,6 +24,23 @@ type Config struct {
 	// use "1" to explicitly disable device locking.
 	HWID string
 
+	// HWIDMode selects how the device identifier is derived when HWID is
+	// empty. The default since 1.0.0 is "sl-hwid": the SL-HWID
+	// fault-tolerant threshold module (opt out with "legacy"
+	// to restore the pre-1.0 hardware-factor hash). An explicit HWID always
+	// takes precedence over either mode.
+	HWIDMode string
+
+	// SLHwidStore optionally redirects the secret-sharing module's
+	// storage to a directory (files on every platform). Empty uses the
+	// platform default (the registry on Windows, an application-support
+	// directory elsewhere).
+	SLHwidStore string
+
+	// SLHwidExtraMandatory names additional hard-locked slots beyond
+	// the module's own persisted value (for example "machine_guid").
+	SLHwidExtraMandatory []string
+
 	// BeatRate is the heartbeat interval. Default 30s; allowed 25s–3600s.
 	BeatRate time.Duration
 
@@ -72,14 +89,19 @@ func DefaultConfig() Config {
 	return Config{
 		Version:                "bypass",
 		HWID:                   "",
+		HWIDMode:               "sl-hwid",
 		BeatRate:               30 * time.Second,
 		RequestTimeout:         15 * time.Second,
 		MaxServerClockSkew:     120 * time.Second,
 		BaseURL:                "https://systemlocker.net",
 		InvisibleFolderBaseURL: "https://invisiblefolder.net",
-		UserAgent:              "systemlocker-bedrock-go/0.1",
+		UserAgent:              "systemlocker-bedrock-go/1.0",
 		AutomaticHeartbeats:    true,
 	}
 }
 
-func (c Config) clone() Config { return c }
+func (c Config) clone() Config {
+	cloned := c
+	cloned.SLHwidExtraMandatory = append([]string(nil), c.SLHwidExtraMandatory...)
+	return cloned
+}

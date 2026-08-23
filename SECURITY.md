@@ -29,6 +29,14 @@ matter therefore live in the protocol, not in obfuscation:
   implemented (the response signature already provides the
   man-in-the-middle defense).
 
+## SL-HWID module
+
+The default threshold HWID module makes copied state and casual spoofing
+harder by requiring a stored enrollment plus enough current factors. Our
+objective is to reduce HWID churn from minor hardware changes, without
+reducing the strength of HWID as a locking mechanism. The key itself is never
+persisted.
+
 ## Reporting a vulnerability
 
 Report privately through the System Locker developer dashboard. Do not open
