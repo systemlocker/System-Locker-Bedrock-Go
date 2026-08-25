@@ -86,19 +86,19 @@ func Prepare(opts Options) (*Session, error) {
 // prepareWith is the testable core of Prepare: factor collection, randomness
 // and storage are injected.
 func prepareWith(opts Options, collect func() (map[string]string, error), rng io.Reader, st store) (*Session, error) {
-	mandatory := map[string]bool{"slstore": true}
+	requestedMandatory := map[string]bool{"slstore": true}
 	for _, name := range opts.ExtraMandatory {
 		if !validSlotName(name) {
 			return nil, fmt.Errorf("slhwid: invalid extra mandatory slot name %q", name)
 		}
-		mandatory[name] = true
+		requestedMandatory[name] = true
 	}
 
 	raw, err := collect()
 	if err != nil {
 		return nil, fmt.Errorf("slhwid: factor collection failed: %w", err)
 	}
-	factors := normalizeFactors(raw)
+	rawFactors := normalizeFactors(raw)
 
 	if st == nil {
 		st, err = defaultStore(opts.StorePath)
@@ -119,17 +119,15 @@ func prepareWith(opts Options, collect func() (map[string]string, error), rng io
 	}
 
 	session := &Session{
-		store:     st,
-		factors:   factors,
-		mandatory: mandatory,
-		rng:       rng,
+		store: st,
+		rng:   rng,
 	}
 
 	// The slstore factor is ours, not collectable hardware: recovery injects
 	// the persisted value (read-only). An absent value with an existing
 	// helper is intentional tampering and recoverCore reports it as a
 	// hard-locked mandatory failure below.
-	if found && !opts.ForceReenroll && factors["slstore"] == "" {
+	if found && !opts.ForceReenroll && rawFactors["slstore"] == "" {
 		value, ok, err := st.ReadSlstore()
 		if err != nil {
 			return nil, fmt.Errorf("slhwid: store secret read failed: %w", err)
@@ -137,20 +135,25 @@ func prepareWith(opts Options, collect func() (map[string]string, error), rng io
 			if len(value) != 32 {
 				return nil, fmt.Errorf("%w: store secret has the wrong size", ErrCorruptHelper)
 			}
-			factors["slstore"] = hex.EncodeToString(value)
+			rawFactors["slstore"] = hex.EncodeToString(value)
 		}
 	}
 
 	if !found || opts.ForceReenroll {
 		// Enrollment creates the persisted store secret before any share
 		// exists.
-		if factors["slstore"] == "" {
+		if rawFactors["slstore"] == "" {
 			value, err := ensureSlstore(st, rng)
 			if err != nil {
 				return nil, err
 			}
-			factors["slstore"] = value
+			rawFactors["slstore"] = value
 		}
+		factors, err := projectFactors(rawFactors, currentNormVersion)
+		if err != nil {
+			return nil, err
+		}
+		mandatory := mapMandatoryToCurrent(requestedMandatory)
 		for name := range mandatory {
 			if factors[name] == "" {
 				return nil, fmt.Errorf("slhwid: mandatory factor %q is not available on this machine", name)
@@ -174,7 +177,7 @@ func prepareWith(opts Options, collect func() (map[string]string, error), rng io
 			return nil, err
 		}
 		cw := checkWord(k)
-		blob = serializeHelper(shares, mandatory, t, salt, cw)
+		blob = serializeHelper(shares, mandatory, t, salt, cw, currentNormVersion)
 		wipe(cw)
 		if err := st.WriteHelper(id, blob); err != nil {
 			return nil, fmt.Errorf("slhwid: helper storage write failed: %w", err)
@@ -183,11 +186,21 @@ func prepareWith(opts Options, collect func() (map[string]string, error), rng io
 		session.fresh = true
 		session.k = k
 		session.hasK = true
+		session.factors = factors
+		session.mandatory = mandatory
 		session.expected = append([]byte(nil), blob...)
 		return session, nil
 	}
 
-	r := recoverCore(blob, factors)
+	helper, err := parseHelper(blob)
+	if err != nil {
+		return nil, fmt.Errorf("%w; re-enroll to recover", ErrCorruptHelper)
+	}
+	recoveryFactors, err := projectFactors(rawFactors, helper.normVersion)
+	if err != nil {
+		return nil, err
+	}
+	r := recoverCore(blob, recoveryFactors)
 	if !r.ok {
 		if r.reason == "corrupt" {
 			return nil, fmt.Errorf("%w; re-enroll to recover", ErrCorruptHelper)
@@ -205,16 +218,17 @@ func prepareWith(opts Options, collect func() (map[string]string, error), rng io
 	session.k = r.k
 	session.hasK = true
 	session.expected = append([]byte(nil), blob...)
-	helper, err := parseHelper(blob)
-	if err != nil {
-		return nil, fmt.Errorf("%w; re-enroll to recover", ErrCorruptHelper)
-	}
-	session.mandatory = map[string]bool{}
+	storedMandatory := map[string]bool{}
 	for _, slot := range helper.slots {
 		if slot.mandatory {
-			session.mandatory[slot.name] = true
+			storedMandatory[slot.name] = true
 		}
 	}
+	session.factors, err = projectFactors(rawFactors, currentNormVersion)
+	if err != nil {
+		return nil, err
+	}
+	session.mandatory = mapMandatoryToCurrent(storedMandatory)
 	return session, nil
 }
 

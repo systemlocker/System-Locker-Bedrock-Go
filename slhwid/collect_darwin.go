@@ -24,6 +24,7 @@ func Collect() (map[string]string, error) {
 		}
 		if v := firstMatch(`"IOPlatformSerialNumber"\s*=\s*"([^"]+)"`, out); v != "" {
 			factors["board_serial"] = v
+			factors["system_serial"] = v
 		}
 	}
 
@@ -47,6 +48,12 @@ func Collect() (map[string]string, error) {
 	if out, err := runCmd(2*time.Second, "ifconfig", "en0"); err == nil {
 		if v := firstMatch(`ether\s+([0-9a-fA-F:]{17})`, out); v != "" {
 			factors["mac"] = v
+		}
+	}
+	if out, err := runCmd(3*time.Second, "networksetup", "-listallhardwareports"); err == nil {
+		if addresses := allMatches(`(?i)Ethernet Address:\s*([0-9a-f:]{17})`, out); len(addresses) > 0 {
+			sort.Strings(addresses)
+			factors["nic_identity"] = strings.Join(addresses, "|")
 		}
 	}
 
@@ -75,6 +82,21 @@ func Collect() (map[string]string, error) {
 	if out, err := runCmd(5*time.Second, "system_profiler", "SPHardwareDataType", "-json"); err == nil {
 		if v := firstMatch(`"spmachine_bootrom_version"\s*:\s*"([^"]+)"`, out); v != "" {
 			factors["firmware"] = v
+		}
+	}
+	if out, err := runCmd(5*time.Second, "system_profiler", "SPMemoryDataType", "-json"); err == nil {
+		if serials := allMatches(`"[^"]*serial[^"]*"\s*:\s*"([^"]+)"`, out); len(serials) > 0 {
+			sort.Strings(serials)
+			factors["memory_modules"] = strings.Join(serials, "|")
+		}
+	}
+	if out, err := runCmd(3*time.Second, "ioreg", "-r", "-c", "AppleSmartBattery"); err == nil {
+		serial := firstMatch(`"BatterySerialNumber"\s*=\s*"([^"]+)"`, out)
+		if serial == "" {
+			serial = firstMatch(`"Serial"\s*=\s*"?([^"\n]+)"?`, out)
+		}
+		if serial != "" {
+			factors["battery_serial"] = serial
 		}
 	}
 

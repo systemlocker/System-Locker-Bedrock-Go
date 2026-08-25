@@ -151,6 +151,9 @@ re-absorbed after each successful authentication. The point is to prevent
 over-fitting to any single machine detail while avoiding over-dependence
 on the exact hardware configuration.
 
+Existing pre-v2 HWIDs remain recoverable with their stored schema and
+threshold; they migrate to the current schema after a successful commit.
+
 Keep the pre-1.0 behavior with `HWIDMode = "legacy"`. A custom `HWID` value (or "1" to
 disable device locking entirely) still wins over both modes.
 

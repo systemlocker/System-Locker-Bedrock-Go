@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -147,18 +148,23 @@ func wipe(b []byte) {
 	}
 }
 
-// threshold applies the §4A.2 rule: 80% above ten factors, 70% for 5–10,
-// never below mandatory+1, and at least five enrolled factors overall.
+// minimumFactors leaves one unavailable-collector margin below the
+// conservative nine-slot physical-machine floor. Revisit it with every
+// factor-schema change; it only governs new/current helpers, not v1 recovery.
+const minimumFactors = 8
+
+// threshold applies the §4A.2 rule: 80% below eight factors and 70% from
+// eight upward, never below mandatory+1, with at least eight slots overall.
 func threshold(n, m int) (int, error) {
-	if n < 5 {
-		return 0, fmt.Errorf("slhwid: need at least 5 enrolled factors, have %d", n)
+	if n < minimumFactors {
+		return 0, fmt.Errorf("slhwid: need at least %d enrolled factor slots, have %d", minimumFactors, n)
 	}
 	if m >= n {
 		return 0, fmt.Errorf("slhwid: mandatory slots (%d) must be fewer than total (%d)", m, n)
 	}
-	num, den := 7, 10 // 5..10 factors → 70%
-	if n > 10 {
-		num, den = 4, 5 // >10 factors → 80%
+	num, den := 7, 10 // 8+ factors → 70%
+	if n < 8 {
+		num, den = 4, 5 // 5..7 factors → 80%
 	}
 	t := (num*n + den - 1) / den
 	if t < m+1 {
@@ -185,11 +191,12 @@ var placeholders = map[string]bool{
 }
 
 // normalize cleans a raw factor value exactly like the legacy hwid module:
-// strip surrounding whitespace and NUL bytes, lowercase; MACs additionally
-// drop ":" and "-".
+// strip surrounding whitespace and NUL bytes, lowercase; MAC-derived values
+// additionally drop ":" and "-". nic_identity may contain several permanent
+// MAC addresses separated by "|", so it needs the same canonicalization.
 func normalize(name, raw string) string {
 	value := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(raw, "\x00", "")))
-	if name == "mac" {
+	if name == "mac" || name == "nic_identity" {
 		value = strings.NewReplacer(":", "", "-", "").Replace(value)
 	}
 	return value
@@ -206,6 +213,114 @@ func normalizeFactors(raw map[string]string) map[string]string {
 			continue
 		}
 		out[name] = nv
+	}
+	return out
+}
+
+const (
+	legacyNormVersion  byte = 1
+	currentNormVersion byte = 2
+)
+
+var legacyFactorNames = []string{
+	"slstore", "machine_guid", "product_uuid", "board_serial", "cpu_id",
+	"disk_serial", "mac", "ram_total", "volume_id", "computer_name",
+	"firmware", "gpu_id", "monitor_edid", "os_build",
+}
+
+var currentDirectFactorNames = []string{
+	"slstore", "machine_guid", "cpu_id", "disk_serial", "ram_total",
+	"volume_id", "firmware", "tpm_ek", "memory_modules", "nic_identity",
+	"battery_serial",
+}
+
+type factorGroup struct {
+	name    string
+	members []string
+}
+
+var currentFactorGroups = []factorGroup{
+	{name: "platform_identity", members: []string{"system_uuid", "board_serial", "system_serial", "chassis_serial"}},
+	{name: "display_group", members: []string{"gpu_id", "monitor_edid"}},
+	{name: "software_environment", members: []string{"computer_name", "os_build"}},
+}
+
+// projectFactors is the single maintenance point for factor-schema changes.
+// Collectors return normalized raw signals. To add a direct factor, collect it
+// on each supported platform and list it in currentDirectFactorNames. To add or
+// change a group, edit currentFactorGroups. Removing/renaming a v1 factor must
+// not change legacyFactorNames: old helpers still need their original inputs
+// for recovery. Such changes require a new norm version and migration vectors.
+func projectFactors(raw map[string]string, normVersion byte) (map[string]string, error) {
+	out := map[string]string{}
+	if normVersion == legacyNormVersion {
+		for _, name := range legacyFactorNames {
+			if value := raw[name]; value != "" {
+				out[name] = value
+			}
+		}
+		return out, nil
+	}
+	if normVersion != currentNormVersion {
+		return nil, fmt.Errorf("slhwid: unsupported factor schema %d", normVersion)
+	}
+	for _, name := range currentDirectFactorNames {
+		if value := raw[name]; value != "" {
+			out[name] = value
+		}
+	}
+	for _, group := range currentFactorGroups {
+		if value := groupValue(group, raw); value != "" {
+			out[group.name] = value
+		}
+	}
+	return out, nil
+}
+
+// groupValue hashes a labelled, fixed-order encoding. Missing members are
+// encoded as empty, so gaining or losing a member changes the one group slot;
+// the group is omitted only when every member is absent.
+func groupValue(group factorGroup, raw map[string]string) string {
+	present := false
+	h := sha256.New()
+	h.Write([]byte("SL-HWID-GROUP2\x00"))
+	h.Write([]byte(group.name))
+	h.Write([]byte{0})
+	for _, member := range group.members {
+		value := raw[member]
+		present = present || value != ""
+		h.Write([]byte(member))
+		h.Write([]byte{0})
+		h.Write([]byte(value))
+		h.Write([]byte{0})
+	}
+	if !present {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func currentMandatoryName(name string) string {
+	switch name {
+	case "product_uuid", "board_serial", "system_uuid", "system_serial", "chassis_serial":
+		return "platform_identity"
+	case "gpu_id", "monitor_edid":
+		return "display_group"
+	case "computer_name", "os_build":
+		return "software_environment"
+	case "mac":
+		return "nic_identity"
+	default:
+		return name
+	}
+}
+
+func mapMandatoryToCurrent(names map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for name, required := range names {
+		if required {
+			out[currentMandatoryName(name)] = true
+		}
 	}
 	return out
 }
@@ -294,10 +409,11 @@ func wipeU64(v []uint64) {
 const helperMagic = "SLSSHWID"
 
 type helperData struct {
-	salt      byte
-	threshold int
-	slots     []helperSlot // sorted by name
-	checkWord []byte
+	normVersion byte
+	salt        byte
+	threshold   int
+	slots       []helperSlot // sorted by name
+	checkWord   []byte
 }
 
 type helperSlot struct {
@@ -316,7 +432,7 @@ func (h *helperData) mandatoryCount() int {
 	return m
 }
 
-func serializeHelper(shares map[string]share, mandatory map[string]bool, t int, salt byte, cw []byte) []byte {
+func serializeHelper(shares map[string]share, mandatory map[string]bool, t int, salt byte, cw []byte, normVersion byte) []byte {
 	names := make([]string, 0, len(shares))
 	for name := range shares {
 		names = append(names, name)
@@ -325,7 +441,7 @@ func serializeHelper(shares map[string]share, mandatory map[string]bool, t int, 
 
 	var payload bytes.Buffer
 	payload.WriteByte(1) // version
-	payload.WriteByte(1) // norm_version
+	payload.WriteByte(normVersion)
 	payload.WriteByte(salt)
 	payload.WriteByte(byte(len(names)))
 	m := 0
@@ -385,7 +501,10 @@ func parseHelper(blob []byte) (*helperData, error) {
 	if body[0] != 1 {
 		return nil, fmt.Errorf("%w: unsupported version %d", ErrCorruptHelper, body[0])
 	}
-	h := &helperData{salt: body[2], threshold: int(body[5]), checkWord: append([]byte(nil), cw...)}
+	if body[1] != legacyNormVersion && body[1] != currentNormVersion {
+		return nil, fmt.Errorf("%w: unsupported factor schema %d", ErrCorruptHelper, body[1])
+	}
+	h := &helperData{normVersion: body[1], salt: body[2], threshold: int(body[5]), checkWord: append([]byte(nil), cw...)}
 	n := int(body[3])
 	rest := body[8:]
 	seen := map[string]bool{}
@@ -647,6 +766,15 @@ func isMandatorySlot(h *helperData, name string) bool {
 // refreshCore re-shares k over the current factors with fresh coefficients.
 // It returns ok=false (skipped) when too few factors remain.
 func refreshCore(k key, factors map[string]string, mandatory map[string]bool, d *draw) ([]byte, bool, error) {
+	// A mapped v1 mandatory name (for example board_serial →
+	// platform_identity) may be unavailable in the current projection. Do not
+	// write a helper that silently drops that hard lock; keeping the old helper
+	// lets a later successful authentication migrate it safely.
+	for name := range mandatory {
+		if factors[name] == "" {
+			return nil, false, nil
+		}
+	}
 	slots := slotList(factors, mandatory)
 	m := 0
 	for _, s := range slots {
@@ -663,7 +791,7 @@ func refreshCore(k key, factors map[string]string, mandatory map[string]bool, d 
 		return nil, false, err
 	}
 	cw := checkWord(k)
-	blob := serializeHelper(shares, mandatory, t, salt, cw)
+	blob := serializeHelper(shares, mandatory, t, salt, cw, currentNormVersion)
 	wipe(cw)
 	return blob, true, nil
 }

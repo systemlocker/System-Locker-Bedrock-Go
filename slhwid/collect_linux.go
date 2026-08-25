@@ -6,6 +6,8 @@
 package slhwid
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -46,6 +48,65 @@ func Collect() (map[string]string, error) {
 	if data, err := os.ReadFile("/sys/class/dmi/id/bios_version"); err == nil {
 		if v := strings.TrimSpace(string(data)); v != "" {
 			factors["firmware"] = v
+		}
+	}
+	// Keep product_uuid for schema-v1 recovery and expose the documented raw
+	// signal under its schema-v2 name as well.
+	if data, err := os.ReadFile("/sys/class/dmi/id/product_uuid"); err == nil {
+		if value := strings.TrimSpace(string(data)); value != "" {
+			factors["system_uuid"] = value
+		}
+	}
+	for slot, path := range map[string]string{
+		"system_serial":  "/sys/class/dmi/id/product_serial",
+		"chassis_serial": "/sys/class/dmi/id/chassis_serial",
+	} {
+		if data, err := os.ReadFile(path); err == nil {
+			if value := strings.TrimSpace(string(data)); value != "" {
+				factors[slot] = value
+			}
+		}
+	}
+	if out, err := runCmd(4*time.Second, "dmidecode", "--type", "memory"); err == nil {
+		if serials := allMatches(`(?m)^\s*Serial Number:\s*(\S.*)$`, out); len(serials) > 0 {
+			sort.Strings(serials)
+			factors["memory_modules"] = strings.Join(serials, "|")
+		}
+	}
+	var nicIDs []string
+	ifaces, _ := filepath.Glob("/sys/class/net/*")
+	for _, iface := range ifaces {
+		if _, err := os.Stat(filepath.Join(iface, "device")); err != nil {
+			continue // virtual interface
+		}
+		if data, err := os.ReadFile(filepath.Join(iface, "perm_address")); err == nil {
+			if value := strings.TrimSpace(string(data)); value != "" && value != "00:00:00:00:00:00" {
+				nicIDs = append(nicIDs, value)
+			}
+		}
+	}
+	if len(nicIDs) > 0 {
+		sort.Strings(nicIDs)
+		factors["nic_identity"] = strings.Join(nicIDs, "|")
+	}
+	var batteries []string
+	batteryPaths, _ := filepath.Glob("/sys/class/power_supply/BAT*/serial_number")
+	for _, path := range batteryPaths {
+		if data, err := os.ReadFile(path); err == nil {
+			if value := strings.TrimSpace(string(data)); value != "" {
+				batteries = append(batteries, value)
+			}
+		}
+	}
+	if len(batteries) > 0 {
+		sort.Strings(batteries)
+		factors["battery_serial"] = strings.Join(batteries, "|")
+	}
+	for _, path := range []string{"/sys/class/tpm/tpm0/device/ek_pub", "/sys/class/tpm/tpm0/ek_pub"} {
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			digest := sha256.Sum256(data)
+			factors["tpm_ek"] = hex.EncodeToString(digest[:])
+			break
 		}
 	}
 

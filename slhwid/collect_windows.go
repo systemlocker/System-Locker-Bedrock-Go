@@ -79,6 +79,15 @@ func regValuesRecursive(path, name string) []string {
 // wmicColumn parses one wmic get column into its trimmed non-empty values.
 func wmicColumn(entity, column string) []string {
 	out, err := runCmd(8*time.Second, "wmic", entity, "get", column)
+	return parseColumn(out, column, err)
+}
+
+func wmicColumnArgs(column string, args ...string) []string {
+	out, err := runCmd(8*time.Second, "wmic", args...)
+	return parseColumn(out, column, err)
+}
+
+func parseColumn(out, column string, err error) []string {
 	if err != nil {
 		return nil
 	}
@@ -91,6 +100,39 @@ func wmicColumn(entity, column string) []string {
 		values = append(values, line)
 	}
 	return values
+}
+
+// cimFactors gathers the newer schema-v2 signals in one PowerShell process.
+// WMIC is optional and deprecated on current Windows versions, so it cannot be
+// the sole source for these factors. Every signal remains best-effort: callers
+// keep their older WMIC result when this query is unavailable.
+func cimFactors() map[string]string {
+	const script = "$ErrorActionPreference='SilentlyContinue';" +
+		"function Emit($n,$v){$c=@($v|Where-Object{$_ -ne $null -and ([string]$_).Trim().Length -gt 0}|ForEach-Object{([string]$_).Trim()}|Sort-Object);if($c.Count -gt 0){Write-Output ($n+'='+($c -join '|'))}};" +
+		"$p=Get-CimInstance Win32_ComputerSystemProduct;Emit 'system_uuid' $p.UUID;Emit 'system_serial' $p.IdentifyingNumber;" +
+		"Emit 'chassis_serial' (Get-CimInstance Win32_SystemEnclosure).SerialNumber;" +
+		"Emit 'disk_serial' (Get-CimInstance Win32_DiskDrive).SerialNumber;" +
+		"Emit 'memory_modules' (Get-CimInstance Win32_PhysicalMemory).SerialNumber;" +
+		"Emit 'nic_identity' (Get-CimInstance Win32_NetworkAdapter|Where-Object{$_.PhysicalAdapter}).PermanentAddress;" +
+		"Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber;" +
+		"$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256;if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash}"
+	out, err := runCmd(12*time.Second, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+	if err != nil {
+		return nil
+	}
+	known := map[string]bool{
+		"system_uuid": true, "system_serial": true, "chassis_serial": true,
+		"disk_serial": true, "memory_modules": true, "nic_identity": true,
+		"battery_serial": true, "tpm_ek": true,
+	}
+	factors := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		name, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok && known[name] && strings.TrimSpace(value) != "" {
+			factors[name] = value
+		}
+	}
+	return factors
 }
 
 // volumeSerial extracts the system drive's volume serial ("xxxx-xxxx"),
@@ -192,6 +234,52 @@ func Collect() (map[string]string, error) {
 	if serials := wmicColumn("diskdrive", "SerialNumber"); len(serials) > 0 {
 		if v := multiInstance(serials); v != "" {
 			factors["disk_serial"] = v
+		}
+	}
+
+	// Schema-v2 signals. The CIM path is primary on modern Windows; WMIC
+	// fallbacks retain coverage for older installations. The legacy names above
+	// remain available unchanged for the recovery half of a migration.
+	for name, value := range cimFactors() {
+		factors[name] = value
+	}
+	if _, ok := factors["system_uuid"]; !ok {
+		if values := wmicColumn("csproduct", "UUID"); len(values) > 0 {
+			factors["system_uuid"] = values[0]
+		}
+	}
+	if _, ok := factors["system_serial"]; !ok {
+		if values := wmicColumn("csproduct", "IdentifyingNumber"); len(values) > 0 {
+			factors["system_serial"] = values[0]
+		}
+	}
+	if _, ok := factors["chassis_serial"]; !ok {
+		if values := wmicColumn("SystemEnclosure", "SerialNumber"); len(values) > 0 {
+			factors["chassis_serial"] = values[0]
+		}
+	}
+	if _, ok := factors["memory_modules"]; !ok {
+		if values := wmicColumn("memorychip", "SerialNumber"); len(values) > 0 {
+			factors["memory_modules"] = multiInstance(values)
+		}
+	}
+	if _, ok := factors["nic_identity"]; !ok {
+		if values := wmicColumnArgs("PermanentAddress", "nic", "where", "PhysicalAdapter=True", "get", "PermanentAddress"); len(values) > 0 {
+			factors["nic_identity"] = multiInstance(values)
+		}
+	}
+	if _, ok := factors["battery_serial"]; !ok {
+		if values := wmicColumnArgs("SerialNumber", `/namespace:\\root\wmi`, "path", "BatteryStaticData", "get", "SerialNumber"); len(values) > 0 {
+			factors["battery_serial"] = multiInstance(values)
+		}
+	}
+	if _, ok := factors["tpm_ek"]; !ok {
+		// Public EK material is safe to read and makes a strong optional
+		// signal. The cmdlet is absent or access-denied on many machines.
+		if out, err := runCmd(8*time.Second, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "(Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256 -ErrorAction Stop).PublicKeyHash"); err == nil {
+			if value := strings.TrimSpace(out); value != "" {
+				factors["tpm_ek"] = value
+			}
 		}
 	}
 

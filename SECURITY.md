@@ -35,7 +35,11 @@ The default threshold HWID module makes copied state and casual spoofing
 harder by requiring a stored enrollment plus enough current factors. Our
 objective is to reduce HWID churn from minor hardware changes, without
 reducing the strength of HWID as a locking mechanism. The key itself is never
-persisted.
+persisted. The module wipes key material deterministically after use,
+matching the rest of this client.
+
+Applications using the same store share one enrollment and HWID. Protect that
+store and choose a separate explicit store when isolation is required.
 
 ## Reporting a vulnerability
 
