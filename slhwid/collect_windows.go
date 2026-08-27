@@ -1,6 +1,6 @@
 // collect_windows.go gathers the §4A.1 factor slots on Windows. The legacy
 // slots reuse the shared hwid collector; the extended slots come from the
-// registry, environment, and best-effort wmic queries (a missing source just
+// registry, environment, and best-effort CIM queries (a missing source just
 // leaves the slot absent — the threshold scheme absorbs it).
 //go:build windows
 
@@ -8,7 +8,6 @@ package slhwid
 
 import (
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -76,36 +75,8 @@ func regValuesRecursive(path, name string) []string {
 	return values
 }
 
-// wmicColumn parses one wmic get column into its trimmed non-empty values.
-func wmicColumn(entity, column string) []string {
-	out, err := runCmd(8*time.Second, "wmic", entity, "get", column)
-	return parseColumn(out, column, err)
-}
-
-func wmicColumnArgs(column string, args ...string) []string {
-	out, err := runCmd(8*time.Second, "wmic", args...)
-	return parseColumn(out, column, err)
-}
-
-func parseColumn(out, column string, err error) []string {
-	if err != nil {
-		return nil
-	}
-	var values []string
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.EqualFold(line, column) {
-			continue
-		}
-		values = append(values, line)
-	}
-	return values
-}
-
 // cimFactors gathers the newer schema-v2 signals in one PowerShell process.
-// WMIC is optional and deprecated on current Windows versions, so it cannot be
-// the sole source for these factors. Every signal remains best-effort: callers
-// keep their older WMIC result when this query is unavailable.
+// It is enrichment only: native values are never replaced by CIM results.
 func cimFactors() map[string]string {
 	const script = "$ErrorActionPreference='SilentlyContinue';" +
 		"function Emit($n,$v){$c=@($v|Where-Object{$_ -ne $null -and ([string]$_).Trim().Length -gt 0}|ForEach-Object{([string]$_).Trim()}|Sort-Object);if($c.Count -gt 0){Write-Output ($n+'='+($c -join '|'))}};" +
@@ -133,24 +104,6 @@ func cimFactors() map[string]string {
 		}
 	}
 	return factors
-}
-
-// volumeSerial extracts the system drive's volume serial ("xxxx-xxxx"),
-// matching on the hex pattern so localized `vol` output still works.
-func volumeSerial() string {
-	drive := os.Getenv("SystemDrive")
-	if drive == "" {
-		drive = "C:"
-	}
-	out, err := runCmd(5*time.Second, "cmd", "/c", "vol", drive)
-	if err != nil {
-		return ""
-	}
-	matches := regexp.MustCompile(`([0-9A-Fa-f]{4}-[0-9A-Fa-f]{4})`).FindAllString(out, -1)
-	if len(matches) == 0 {
-		return ""
-	}
-	return matches[len(matches)-1]
 }
 
 // Collect gathers the available §4A factor slots on Windows. Missing
@@ -186,6 +139,9 @@ func Collect() (map[string]string, error) {
 			}
 			factors[entry.name] = value
 		}
+	}
+	if value := nativeSystemUUID(); value != "" {
+		factors["system_uuid"] = value
 	}
 
 	if v := os.Getenv("COMPUTERNAME"); v != "" {
@@ -231,66 +187,18 @@ func Collect() (map[string]string, error) {
 		}
 	}
 
-	if serials := wmicColumn("diskdrive", "SerialNumber"); len(serials) > 0 {
-		if v := multiInstance(serials); v != "" {
-			factors["disk_serial"] = v
-		}
-	}
-
-	// Schema-v2 signals. The CIM path is primary on modern Windows; WMIC
-	// fallbacks retain coverage for older installations. The legacy names above
-	// remain available unchanged for the recovery half of a migration.
+	// CIM only enriches native collection; a provider cannot change the
+	// semantics of an already-collected slot.
 	for name, value := range cimFactors() {
-		factors[name] = value
-	}
-	if _, ok := factors["system_uuid"]; !ok {
-		if values := wmicColumn("csproduct", "UUID"); len(values) > 0 {
-			factors["system_uuid"] = values[0]
-		}
-	}
-	if _, ok := factors["system_serial"]; !ok {
-		if values := wmicColumn("csproduct", "IdentifyingNumber"); len(values) > 0 {
-			factors["system_serial"] = values[0]
-		}
-	}
-	if _, ok := factors["chassis_serial"]; !ok {
-		if values := wmicColumn("SystemEnclosure", "SerialNumber"); len(values) > 0 {
-			factors["chassis_serial"] = values[0]
-		}
-	}
-	if _, ok := factors["memory_modules"]; !ok {
-		if values := wmicColumn("memorychip", "SerialNumber"); len(values) > 0 {
-			factors["memory_modules"] = multiInstance(values)
-		}
-	}
-	if _, ok := factors["nic_identity"]; !ok {
-		if values := wmicColumnArgs("PermanentAddress", "nic", "where", "PhysicalAdapter=True", "get", "PermanentAddress"); len(values) > 0 {
-			factors["nic_identity"] = multiInstance(values)
-		}
-	}
-	if _, ok := factors["battery_serial"]; !ok {
-		if values := wmicColumnArgs("SerialNumber", `/namespace:\\root\wmi`, "path", "BatteryStaticData", "get", "SerialNumber"); len(values) > 0 {
-			factors["battery_serial"] = multiInstance(values)
-		}
-	}
-	if _, ok := factors["tpm_ek"]; !ok {
-		// Public EK material is safe to read and makes a strong optional
-		// signal. The cmdlet is absent or access-denied on many machines.
-		if out, err := runCmd(8*time.Second, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "(Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256 -ErrorAction Stop).PublicKeyHash"); err == nil {
-			if value := strings.TrimSpace(out); value != "" {
-				factors["tpm_ek"] = value
-			}
+		if _, exists := factors[name]; !exists {
+			factors[name] = value
 		}
 	}
 
-	if totals := wmicColumn("ComputerSystem", "TotalPhysicalMemory"); len(totals) > 0 {
-		digits := regexp.MustCompile(`\d+`).FindString(totals[0])
-		if digits != "" {
-			factors["ram_total"] = digits
-		}
+	if v := nativeRamTotal(); v != "" {
+		factors["ram_total"] = v
 	}
-
-	if v := volumeSerial(); v != "" {
+	if v := nativeVolumeSerial(); v != "" {
 		factors["volume_id"] = v
 	}
 

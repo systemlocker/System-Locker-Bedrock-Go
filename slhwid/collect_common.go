@@ -1,3 +1,5 @@
+//go:build !windows
+
 // collect_common.go holds the shared subprocess plumbing for the platform
 // factor collectors.
 package slhwid

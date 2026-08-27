@@ -18,7 +18,7 @@ const (
 	slstoreName = "SLStore"
 )
 
-type registryStore struct{}
+type registryStore struct{ selectedRoot string }
 
 func (s *registryStore) lock() (func(), error) {
 	directory, err := localLockDirectory()
@@ -95,49 +95,104 @@ func regWriteBinary(root, name string, data []byte) error {
 	return exec.Command("reg", "add", root, "/v", name, "/t", "REG_BINARY", "/d", string(hex), "/f", "/reg:64").Run()
 }
 
-func (s *registryStore) ReadSlstore() ([]byte, bool, error) {
-	for _, root := range []string{regRootHKLM, regRootHKCU} {
-		data, found, err := regReadBinary(root, slstoreName)
+// selectRoot pins one helper and its mandatory SLStore to a coherent hive.
+// Complete pairs win (HKLM before HKCU); partial pairs are deliberately kept
+// partial so recovery never combines state from different enrollments.
+func (s *registryStore) selectRoot(helperName string) (string, error) {
+	if s.selectedRoot != "" {
+		return s.selectedRoot, nil
+	}
+	lmStore, lmStoreFound, err := regReadBinary(regRootHKLM, slstoreName)
+	_ = lmStore
+	if err != nil {
+		return "", err
+	}
+	cuStore, cuStoreFound, err := regReadBinary(regRootHKCU, slstoreName)
+	_ = cuStore
+	if err != nil {
+		return "", err
+	}
+	var lmHelperFound, cuHelperFound bool
+	if helperName != "" {
+		_, lmHelperFound, err = regReadBinary(regRootHKLM, helperName)
 		if err != nil {
-			return nil, false, err
+			return "", err
 		}
-		if found {
-			value, err := unwrapSlstore(data)
-			if err != nil {
-				return nil, false, err
-			}
-			return value, true, nil
+		_, cuHelperFound, err = regReadBinary(regRootHKCU, helperName)
+		if err != nil {
+			return "", err
 		}
 	}
-	return nil, false, nil
+	switch {
+	case helperName != "" && lmHelperFound && lmStoreFound || helperName == "" && lmStoreFound:
+		s.selectedRoot = regRootHKLM
+	case helperName != "" && cuHelperFound && cuStoreFound || helperName == "" && cuStoreFound:
+		s.selectedRoot = regRootHKCU
+	case lmHelperFound || lmStoreFound:
+		s.selectedRoot = regRootHKLM
+	case cuHelperFound || cuStoreFound:
+		s.selectedRoot = regRootHKCU
+	}
+	return s.selectedRoot, nil
+}
+
+func (s *registryStore) writePinned(name string, data []byte) error {
+	root, err := s.selectRoot("")
+	if err != nil {
+		return err
+	}
+	if root != "" {
+		return regWriteBinary(root, name, data)
+	}
+	if err := regWriteBinary(regRootHKLM, name, data); err == nil {
+		s.selectedRoot = regRootHKLM
+		return nil
+	}
+	if err := regWriteBinary(regRootHKCU, name, data); err == nil {
+		s.selectedRoot = regRootHKCU
+		return nil
+	} else {
+		return err
+	}
+}
+
+func (s *registryStore) ReadSlstore() ([]byte, bool, error) {
+	root, err := s.selectRoot("")
+	if err != nil {
+		return nil, false, err
+	}
+	if root == "" {
+		return nil, false, nil
+	}
+	data, found, err := regReadBinary(root, slstoreName)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	value, err := unwrapSlstore(data)
+	if err != nil {
+		return nil, false, err
+	}
+	return value, true, nil
 }
 
 func (s *registryStore) WriteSlstore(value []byte) error {
 	blob := append(append([]byte(nil), slstorePrefix...), value...)
-	if err := regWriteBinary(regRootHKLM, slstoreName, blob); err == nil {
-		return nil
-	}
-	return regWriteBinary(regRootHKCU, slstoreName, blob)
+	return s.writePinned(slstoreName, blob)
 }
 
 func (s *registryStore) ReadHelper(id string) ([]byte, bool, error) {
 	name := "HWID-" + id
-	for _, root := range []string{regRootHKLM, regRootHKCU} {
-		blob, found, err := regReadBinary(root, name)
-		if err != nil {
-			return nil, false, err
-		}
-		if found {
-			return blob, true, nil
-		}
+	root, err := s.selectRoot(name)
+	if err != nil {
+		return nil, false, err
 	}
-	return nil, false, nil
+	if root == "" {
+		return nil, false, nil
+	}
+	return regReadBinary(root, name)
 }
 
 func (s *registryStore) WriteHelper(id string, blob []byte) error {
 	name := "HWID-" + id
-	if err := regWriteBinary(regRootHKLM, name, blob); err == nil {
-		return nil
-	}
-	return regWriteBinary(regRootHKCU, name, blob)
+	return s.writePinned(name, blob)
 }

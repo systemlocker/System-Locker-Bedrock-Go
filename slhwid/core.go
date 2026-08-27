@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -181,13 +182,18 @@ func threshold(n, m int) (int, error) {
 // placeholders are junk values that count as "missing" (shared set with the
 // legacy §4 hwid specification).
 var placeholders = map[string]bool{
-	"":                       true,
-	"none":                   true,
-	"unknown":                true,
-	"default string":         true,
-	"to be filled by o.e.m.": true,
-	"not specified":          true,
-	"system serial number":   true,
+	"": true, "0": true, "none": true, "unknown": true, "default": true,
+	"default string": true, "to be filled by o.e.m.": true, "not specified": true,
+	"not available": true, "not applicable": true, "not present": true, "n/a": true,
+	"na": true, "null": true, "system serial number": true, "asset tag": true,
+	"no asset tag": true, "123456789": true, "0123456789": true, "example": true,
+}
+
+var identifierFactors = map[string]bool{
+	"machine_guid": true, "product_uuid": true, "system_uuid": true, "board_serial": true,
+	"system_serial": true, "chassis_serial": true, "disk_serial": true, "volume_id": true,
+	"tpm_ek": true, "memory_modules": true, "nic_identity": true, "battery_serial": true,
+	"monitor_edid": true,
 }
 
 // normalize cleans a raw factor value exactly like the legacy hwid module:
@@ -195,7 +201,7 @@ var placeholders = map[string]bool{
 // additionally drop ":" and "-". nic_identity may contain several permanent
 // MAC addresses separated by "|", so it needs the same canonicalization.
 func normalize(name, raw string) string {
-	value := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(raw, "\x00", "")))
+	value := asciiLower(strings.TrimSpace(strings.ReplaceAll(raw, "\x00", "")))
 	if name == "mac" || name == "nic_identity" {
 		value = strings.NewReplacer(":", "", "-", "").Replace(value)
 	}
@@ -204,12 +210,89 @@ func normalize(name, raw string) string {
 
 func isMissing(value string) bool { return placeholders[strings.TrimSpace(value)] }
 
+func asciiLower(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, value)
+}
+
+func isHex(value string) bool {
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDegenerateIdentifier(value string) bool {
+	compact := strings.Map(func(r rune) rune {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return r
+		}
+		return -1
+	}, value)
+	if len(compact) < 4 {
+		return false
+	}
+	allZero, allF := true, true
+	for _, r := range compact {
+		allZero = allZero && r == '0'
+		allF = allF && r == 'f'
+	}
+	return allZero || allF
+}
+
+func isUUIDLike(value string) bool {
+	validLength := len(value) == 32 || (len(value) == 36 && value[8] == '-' && value[13] == '-' && value[18] == '-' && value[23] == '-')
+	compact := strings.ReplaceAll(value, "-", "")
+	return validLength && len(compact) == 32 && isHex(compact) && !isDegenerateIdentifier(compact) && compact != "12345678123412341234123456789abc"
+}
+
+func isSaneFactor(name, value string) bool {
+	if value == "" || len([]byte(value)) > 4096 || isMissing(value) {
+		return false
+	}
+	if name == "ram_total" {
+		n, err := strconv.ParseUint(value, 10, 64)
+		return err == nil && n >= 128*1024*1024 && strings.Trim(value, "0123456789") == ""
+	}
+	if name == "machine_guid" || name == "product_uuid" || name == "system_uuid" {
+		return isUUIDLike(value)
+	}
+	if name == "slstore" {
+		return len(value) == 64 && isHex(value) && !isDegenerateIdentifier(value)
+	}
+	if name == "tpm_ek" {
+		return len(value) == 64 && isHex(value)
+	}
+	if name == "mac" || name == "nic_identity" {
+		for _, part := range strings.Split(value, "|") {
+			if len(part) != 12 || !isHex(part) || isDegenerateIdentifier(part) {
+				return false
+			}
+		}
+		return true
+	}
+	if identifierFactors[name] {
+		for _, part := range strings.Split(value, "|") {
+			if isMissing(part) || isDegenerateIdentifier(part) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // normalizeFactors normalizes every collected value and drops placeholders.
 func normalizeFactors(raw map[string]string) map[string]string {
 	out := make(map[string]string, len(raw))
 	for name, value := range raw {
 		nv := normalize(name, value)
-		if nv == "" || isMissing(nv) {
+		if !isSaneFactor(name, nv) {
 			continue
 		}
 		out[name] = nv
@@ -482,6 +565,11 @@ func serializeHelper(shares map[string]share, mandatory map[string]bool, t int, 
 }
 
 func parseHelper(blob []byte) (*helperData, error) {
+	// This is writable local state. Keep both its byte size and the recovery
+	// search input bounded before hashing or allocating from its header.
+	if len(blob) > 4096 {
+		return nil, fmt.Errorf("%w: oversized", ErrCorruptHelper)
+	}
 	if len(blob) < 8+4+8+32+32 {
 		return nil, fmt.Errorf("%w: truncated", ErrCorruptHelper)
 	}
@@ -493,7 +581,7 @@ func parseHelper(blob []byte) (*helperData, error) {
 		return nil, fmt.Errorf("%w: integrity mismatch", ErrCorruptHelper)
 	}
 	payloadLen := int(binary.LittleEndian.Uint32(blob[8:12]))
-	if 12+payloadLen+64 != len(blob) {
+	if payloadLen < 8 || payloadLen > 4096 || 12+payloadLen+64 != len(blob) {
 		return nil, fmt.Errorf("%w: length mismatch", ErrCorruptHelper)
 	}
 	body := blob[12 : 12+payloadLen]
@@ -504,10 +592,35 @@ func parseHelper(blob []byte) (*helperData, error) {
 	if body[1] != legacyNormVersion && body[1] != currentNormVersion {
 		return nil, fmt.Errorf("%w: unsupported factor schema %d", ErrCorruptHelper, body[1])
 	}
+	if body[6] != 0 || body[7] != 0 {
+		return nil, fmt.Errorf("%w: reserved header bits set", ErrCorruptHelper)
+	}
+	allowed := map[string]bool{}
+	if body[1] == legacyNormVersion {
+		for _, name := range legacyFactorNames {
+			allowed[name] = true
+		}
+	} else {
+		for _, name := range currentDirectFactorNames {
+			allowed[name] = true
+		}
+		for _, group := range currentFactorGroups {
+			allowed[group.name] = true
+		}
+	}
 	h := &helperData{normVersion: body[1], salt: body[2], threshold: int(body[5]), checkWord: append([]byte(nil), cw...)}
 	n := int(body[3])
+	mandatoryHeader := int(body[4])
+	if n == 0 || n > len(allowed) {
+		return nil, fmt.Errorf("%w: invalid slot count", ErrCorruptHelper)
+	}
+	if h.threshold == 0 || h.threshold > n || mandatoryHeader == 0 || mandatoryHeader >= h.threshold {
+		return nil, fmt.Errorf("%w: invalid threshold", ErrCorruptHelper)
+	}
 	rest := body[8:]
 	seen := map[string]bool{}
+	previous := ""
+	mandatoryCount := 0
 	for i := 0; i < n; i++ {
 		if len(rest) < 1 {
 			return nil, fmt.Errorf("%w: slot truncated", ErrCorruptHelper)
@@ -517,11 +630,22 @@ func parseHelper(blob []byte) (*helperData, error) {
 			return nil, fmt.Errorf("%w: slot truncated", ErrCorruptHelper)
 		}
 		name := string(rest[1 : 1+nameLen])
-		if seen[name] {
-			return nil, fmt.Errorf("%w: duplicate slot %q", ErrCorruptHelper, name)
+		if !allowed[name] {
+			return nil, fmt.Errorf("%w: invalid slot %q", ErrCorruptHelper, name)
+		}
+		if seen[name] || (previous != "" && previous >= name) {
+			return nil, fmt.Errorf("%w: duplicate or unsorted slot %q", ErrCorruptHelper, name)
 		}
 		seen[name] = true
-		mandatory := rest[1+nameLen]&1 == 1
+		previous = name
+		flags := rest[1+nameLen]
+		if flags != 0 && flags != 1 {
+			return nil, fmt.Errorf("%w: invalid slot flags", ErrCorruptHelper)
+		}
+		mandatory := flags == 1
+		if mandatory {
+			mandatoryCount++
+		}
 		var sh share
 		for l := 0; l < 4; l++ {
 			sh[l] = binary.LittleEndian.Uint64(rest[2+nameLen+l*8:])
@@ -534,6 +658,19 @@ func parseHelper(blob []byte) (*helperData, error) {
 	}
 	if len(rest) != 0 {
 		return nil, fmt.Errorf("%w: trailing bytes", ErrCorruptHelper)
+	}
+	if mandatoryCount != mandatoryHeader {
+		return nil, fmt.Errorf("%w: mandatory count mismatch", ErrCorruptHelper)
+	}
+	slstoreMandatory := false
+	for _, slot := range h.slots {
+		if slot.name == "slstore" {
+			slstoreMandatory = slot.mandatory
+			break
+		}
+	}
+	if !slstoreMandatory {
+		return nil, fmt.Errorf("%w: mandatory slstore missing", ErrCorruptHelper)
 	}
 	return h, nil
 }
