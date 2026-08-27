@@ -3,7 +3,6 @@ package bedrock
 import (
 	"context"
 	"encoding/json"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -156,11 +155,16 @@ func (f *InvisibleFolder) Download(ctx context.Context, referenceID string) ([]b
 		return nil, fail(ErrSessionTerminated, "No Invisible Folder token is available. Request one during initialization or a heartbeat.")
 	}
 
-	response := f.client.transport().PostForm(
+	// The download route is a plain GET; credentials travel in headers
+	// because GET request bodies are not supported.
+	headers := map[string]string{
+		"X-Invisiblefolder-Download": "1",
+		"X-Invisiblefolder-Token":    token,
+	}
+	response := f.client.transport().Get(
 		ctx,
 		f.client.endpoint(config.InvisibleFolderBaseURL, invisibleDownloadPrefix)+referenceID,
-		url.Values{"invisiblefolder_token": {token}},
-		nil)
+		headers)
 	if !response.OK() {
 		if message := invisibleErrorMessage(response); message != "" {
 			return nil, fail(ErrTransport, "Invisible Folder download failed: %s", message)
