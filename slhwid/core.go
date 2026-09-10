@@ -775,9 +775,15 @@ func findRecoveringSubset(mandatory, optional []point, t int, cw []byte) []point
 			for _, i := range idx {
 				pts = append(pts, optional[i])
 			}
-			if res == nil && ctEqual(checkWord(keyFromPoints(pts)), cw) {
+			// Keep doing the cryptographic work after the first match;
+			// walking the remaining combinations alone leaks its position.
+			k := keyFromPoints(pts)
+			cand := checkWord(k)
+			if ctEqual(cand, cw) && res == nil {
 				res = pts
 			}
+			wipeU64(k[:])
+			wipe(cand)
 			return
 		}
 		for i := start; i <= len(optional)-(need-len(idx)); i++ {
@@ -845,7 +851,8 @@ func recoverCore(blob []byte, factors map[string]string) recoverResult {
 					opt2 = append(opt2, pt)
 				}
 			}
-			if culprit == "" && findRecoveringSubset(mand2, opt2, t, h.checkWord) != nil {
+			recovers := findRecoveringSubset(mand2, opt2, t, h.checkWord) != nil
+			if recovers && culprit == "" {
 				culprit = ms.name
 			}
 		}
@@ -874,11 +881,10 @@ func recoverCore(blob []byte, factors map[string]string) recoverResult {
 		xq := deriveX(s.name, value, h.salt)
 		onCurve := true
 		for l := 0; l < 4; l++ {
+			// Constant work: every limb is evaluated so timing does not
+			// reveal which limb first disagreed.
 			xs, ys := coords(found, l)
-			if evaluateAt(xs, ys, xq) != s.share[l] {
-				onCurve = false
-				break
-			}
+			onCurve = onCurve && evaluateAt(xs, ys, xq) == s.share[l]
 		}
 		if onCurve {
 			live = append(live, s.name)

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -212,12 +213,9 @@ func prepareWith(opts Options, collect func() (map[string]string, error), rng io
 			Mandatory: r.reason == "mandatory",
 		}
 	}
-	session.hwid = r.hwid
-	session.drifted = r.dead
-	session.pending = r.pending
-	session.k = r.k
-	session.hasK = true
 	session.expected = append([]byte(nil), blob...)
+	// A second application must not weaken a hard lock selected by the
+	// application that enrolled the shared device helper.
 	storedMandatory := map[string]bool{}
 	for _, slot := range helper.slots {
 		if slot.mandatory {
@@ -229,6 +227,51 @@ func prepareWith(opts Options, collect func() (map[string]string, error), rng io
 		return nil, err
 	}
 	session.mandatory = mapMandatoryToCurrent(storedMandatory)
+	// Promoting an enrolled optional slot must not absorb a change to it.
+	// Newly available slots are bound after authorization by Commit.
+	deadSet := make(map[string]bool, len(r.dead))
+	for _, name := range r.dead {
+		deadSet[name] = true
+	}
+	changed := mapMandatoryToCurrent(deadSet)
+	policyChanged := false
+	var unavailable []string
+	for name := range mapMandatoryToCurrent(requestedMandatory) {
+		if session.mandatory[name] {
+			continue
+		}
+		if session.factors[name] == "" || changed[name] {
+			unavailable = append(unavailable, name)
+			continue
+		}
+		session.mandatory[name] = true
+		policyChanged = true
+	}
+	if len(unavailable) > 0 {
+		r.k = key{} // best-effort zeroization of the unrecoverable key
+		sort.Strings(unavailable)
+		present := 0
+		for _, slot := range helper.slots {
+			if recoveryFactors[slot.name] != "" {
+				present++
+			}
+		}
+		return nil, &DriftError{
+			Present:   present,
+			Needed:    helper.threshold,
+			Missing:   unavailable,
+			Mandatory: true,
+		}
+	}
+	if policyChanged && len(session.mandatory) >= len(session.factors) {
+		r.k = key{}
+		return nil, fmt.Errorf("slhwid: mandatory slots must be fewer than total factors")
+	}
+	session.hwid = r.hwid
+	session.drifted = r.dead
+	session.pending = r.pending || policyChanged
+	session.k = r.k
+	session.hasK = true
 	return session, nil
 }
 
