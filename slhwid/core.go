@@ -292,6 +292,18 @@ func normalizeFactors(raw map[string]string) map[string]string {
 	out := make(map[string]string, len(raw))
 	for name, value := range raw {
 		nv := normalize(name, value)
+		if name == "memory_modules" && len(nv) <= 4096 {
+			// Keep usable modules beside OEM placeholders. Preserve order and
+			// duplicates so previously accepted inventories keep exactly the
+			// same enrolled value.
+			usable := make([]string, 0, 8)
+			for _, part := range strings.Split(nv, "|") {
+				if isSaneFactor(name, part) {
+					usable = append(usable, part)
+				}
+			}
+			nv = strings.Join(usable, "|")
+		}
 		if !isSaneFactor(name, nv) {
 			continue
 		}

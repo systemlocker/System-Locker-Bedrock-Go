@@ -95,7 +95,7 @@ func DefaultConfig() Config {
 		MaxServerClockSkew:     120 * time.Second,
 		BaseURL:                "https://systemlocker.net",
 		InvisibleFolderBaseURL: "https://invisiblefolder.net",
-		UserAgent:              "systemlocker-bedrock-go/1.1.0",
+		UserAgent:              "systemlocker-bedrock-go/1.2.0",
 		AutomaticHeartbeats:    true,
 	}
 }

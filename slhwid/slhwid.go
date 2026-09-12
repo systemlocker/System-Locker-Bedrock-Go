@@ -269,7 +269,22 @@ func prepareWith(opts Options, collect func() (map[string]string, error), rng io
 	}
 	session.hwid = r.hwid
 	session.drifted = r.dead
-	session.pending = r.pending || policyChanged
+	// A newly readable optional source needs a post-authorization refresh,
+	// even when every previously enrolled share still matches.
+	enrolled := make(map[string]bool, len(helper.slots))
+	for _, slot := range helper.slots {
+		enrolled[slot.name] = true
+	}
+	addedFactors := false
+	if helper.normVersion == currentNormVersion {
+		for name := range session.factors {
+			if !enrolled[name] {
+				addedFactors = true
+				break
+			}
+		}
+	}
+	session.pending = r.pending || policyChanged || addedFactors
 	session.k = r.k
 	session.hasK = true
 	return session, nil
@@ -327,7 +342,7 @@ func (s *Session) FreshlyEnrolled() bool { return s.fresh }
 // DriftedSlots lists enrolled slots that were dead at Prepare time.
 func (s *Session) DriftedSlots() []string { return s.drifted }
 
-// PendingRefresh reports whether any slot was dead (Commit will re-center).
+// PendingRefresh reports whether drift, newly available factors, or added hard locks need a refresh.
 func (s *Session) PendingRefresh() bool { return s.pending }
 
 func (s *Session) wipeSecret() {
