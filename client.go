@@ -2,8 +2,8 @@ package bedrock
 
 import (
 	"context"
-	"github.com/systemlocker/system-locker-bedrock-go/hwid"
-	"github.com/systemlocker/system-locker-bedrock-go/slhwid"
+	"github.com/systemlocker/system-locker-bedrock-go/v2/hwid"
+	"github.com/systemlocker/system-locker-bedrock-go/v2/slhwid"
 	"net/url"
 	"strconv"
 	"strings"
@@ -283,7 +283,7 @@ func (c *Client) signedHeaders() map[string]string {
 	return map[string]string{"X-Bedrock-Key-Id": c.config.SigningKeyID}
 }
 
-// prepareSecretSharing recovers (or enrolls) the §4A module's HWID for the
+// prepareSecretSharing recovers (or enrolls) the SL-HWID module's HWID for the
 // identity, caching one session per identity.
 func (c *Client) prepareSecretSharing(identity string) (SLHwidSession, error) {
 	c.mutex.Lock()

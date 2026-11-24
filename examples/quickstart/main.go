@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	bedrock "github.com/systemlocker/system-locker-bedrock-go"
-	"github.com/systemlocker/system-locker-bedrock-go/hwid"
+	bedrock "github.com/systemlocker/system-locker-bedrock-go/v2"
+	"github.com/systemlocker/system-locker-bedrock-go/v2/hwid"
 )
 
 func main() {

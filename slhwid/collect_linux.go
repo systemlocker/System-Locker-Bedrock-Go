@@ -1,4 +1,4 @@
-// collect_linux.go gathers the §4A.1 factor slots on Linux: the legacy slots
+// collect_linux.go gathers the SL-HWID factor slots on Linux: the legacy slots
 // reuse the shared hwid collector (sysfs, /etc/machine-id) and the extended
 // slots come from procfs, os-release, findmnt, and DRM EDID files.
 //go:build linux
@@ -11,12 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/systemlocker/system-locker-bedrock-go/hwid"
+	"github.com/systemlocker/system-locker-bedrock-go/v2/hwid"
 )
 
 func Collect() (map[string]string, error) {
@@ -69,8 +68,7 @@ func Collect() (map[string]string, error) {
 	}
 	if out, err := runCmd(4*time.Second, "dmidecode", "--type", "memory"); err == nil {
 		if serials := allMatches(`(?m)^\s*Serial Number:\s*(\S.*)$`, out); len(serials) > 0 {
-			sort.Strings(serials)
-			factors["memory_modules"] = strings.Join(serials, "|")
+			factors["memory_modules"] = joinInstances(serials)
 		}
 	}
 	var nicIDs []string
@@ -86,8 +84,7 @@ func Collect() (map[string]string, error) {
 		}
 	}
 	if len(nicIDs) > 0 {
-		sort.Strings(nicIDs)
-		factors["nic_identity"] = strings.Join(nicIDs, "|")
+		factors["nic_identity"] = joinInstances(nicIDs)
 	}
 	var batteries []string
 	batteryPaths, _ := filepath.Glob("/sys/class/power_supply/BAT*/serial_number")
@@ -99,8 +96,7 @@ func Collect() (map[string]string, error) {
 		}
 	}
 	if len(batteries) > 0 {
-		sort.Strings(batteries)
-		factors["battery_serial"] = strings.Join(batteries, "|")
+		factors["battery_serial"] = joinInstances(batteries)
 	}
 	for _, path := range []string{"/sys/class/tpm/tpm0/device/ek_pub", "/sys/class/tpm/tpm0/ek_pub"} {
 		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
@@ -116,6 +112,30 @@ func Collect() (map[string]string, error) {
 		}
 	}
 
+	// fixed_disk_serial (schema v3): every block device with a serial that is
+	// neither marked removable nor attached through USB. NVMe/SCSI expose
+	// device/serial; virtio exposes serial on the block device itself.
+	var fixedDisks []string
+	blockDevices, _ := filepath.Glob("/sys/block/*")
+	for _, block := range blockDevices {
+		if data, err := os.ReadFile(filepath.Join(block, "removable")); err == nil && strings.TrimSpace(string(data)) == "1" {
+			continue
+		}
+		if target, err := filepath.EvalSymlinks(block); err == nil && strings.Contains(target, "/usb") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(block, "device", "serial"))
+		if err != nil {
+			data, err = os.ReadFile(filepath.Join(block, "serial"))
+		}
+		if err == nil {
+			fixedDisks = append(fixedDisks, string(data))
+		}
+	}
+	if v := joinInstances(fixedDisks); v != "" {
+		factors["fixed_disk_serial"] = v
+	}
+
 	// monitor_edid: hex of every non-empty DRM EDID blob, sorted.
 	var blobs []string
 	edids, _ := filepath.Glob("/sys/class/drm/card*-*/edid")
@@ -127,8 +147,7 @@ func Collect() (map[string]string, error) {
 		blobs = append(blobs, hexLower(data))
 	}
 	if len(blobs) > 0 {
-		sort.Strings(blobs)
-		factors["monitor_edid"] = strings.Join(blobs, "|")
+		factors["monitor_edid"] = joinInstances(blobs)
 	}
 
 	// gpu_id: display-class PCI devices (class 0x03xxxx), vendor:device.
@@ -150,8 +169,7 @@ func Collect() (map[string]string, error) {
 		}
 	}
 	if len(gpus) > 0 {
-		sort.Strings(gpus)
-		factors["gpu_id"] = strings.Join(gpus, "|")
+		factors["gpu_id"] = joinInstances(gpus)
 	}
 
 	return factors, nil

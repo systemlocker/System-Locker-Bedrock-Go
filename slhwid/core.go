@@ -1,4 +1,4 @@
-// core.go implements the §4A cryptographic core: GF(2^61-1) arithmetic on
+// core.go implements the SL-HWID cryptographic core: GF(2^61-1) arithmetic on
 // uint64, four-limb secret sharing, x-derivation, helper-blob serialization,
 // recovery and refresh. Everything here is pure and platform-free; the
 // lifecycle in slhwid.go wires it to collectors, storage and the CSPRNG.
@@ -154,7 +154,7 @@ func wipe(b []byte) {
 // factor-schema change; it only governs new/current helpers, not v1 recovery.
 const minimumFactors = 8
 
-// threshold applies the §4A.2 rule: 80% below eight factors and 70% from
+// threshold applies the recovery rule: 80% below eight factors and 70% from
 // eight upward, never below mandatory+1, with at least eight slots overall.
 func threshold(n, m int) (int, error) {
 	if n < minimumFactors {
@@ -179,8 +179,8 @@ func threshold(n, m int) (int, error) {
 
 // ───────────────────────── normalization ─────────────────────────
 
-// placeholders are junk values that count as "missing" (shared set with the
-// legacy §4 hwid specification).
+// placeholders are junk values that count as "missing" (shared with the
+// legacy hwid derivation).
 var placeholders = map[string]bool{
 	"": true, "0": true, "none": true, "unknown": true, "default": true,
 	"default string": true, "to be filled by o.e.m.": true, "not specified": true,
@@ -191,7 +191,7 @@ var placeholders = map[string]bool{
 
 var identifierFactors = map[string]bool{
 	"machine_guid": true, "product_uuid": true, "system_uuid": true, "board_serial": true,
-	"system_serial": true, "chassis_serial": true, "disk_serial": true, "volume_id": true,
+	"system_serial": true, "chassis_serial": true, "disk_serial": true, "fixed_disk_serial": true, "volume_id": true,
 	"tpm_ek": true, "memory_modules": true, "nic_identity": true, "battery_serial": true,
 	"monitor_edid": true,
 }
@@ -309,12 +309,55 @@ func normalizeFactors(raw map[string]string) map[string]string {
 		}
 		out[name] = nv
 	}
+	// Derived, never collected: a supplied value is always replaced.
+	delete(out, "edid_digests")
+	if edids, ok := raw["monitor_edid"]; ok {
+		if digests := edidDigests(normalize("monitor_edid", edids)); digests != "" && isSaneFactor("edid_digests", digests) {
+			out["edid_digests"] = digests
+		}
+	}
 	return out
+}
+
+// edidDigests is schema v3's display signal: one lowercase-hex SHA-256 per
+// usable monitor_edid member, sorted bytewise. Windows keeps the EDID of
+// every monitor ever attached, and the hex inventory regularly exceeds the
+// 4096-byte factor limit; the digests stay small. They are derived before
+// that limit drops monitor_edid.
+func edidDigests(normalized string) string {
+	if len(normalized) > 1024*1024 {
+		return "" // bound the hashing work on untrusted input
+	}
+	var digests []string
+	for _, part := range strings.Split(normalized, "|") {
+		if isMissing(part) || isDegenerateIdentifier(part) {
+			continue
+		}
+		digest := sha256.Sum256([]byte(part))
+		digests = append(digests, hex.EncodeToString(digest[:]))
+	}
+	sort.Strings(digests)
+	return strings.Join(digests, "|")
+}
+
+// joinInstances is the canonical multi-instance form shared by every
+// implementation: trim each member of ASCII whitespace, drop empty members,
+// sort bytewise and join with "|".
+func joinInstances(values []string) string {
+	cleaned := make([]string, 0, len(values))
+	for _, v := range values {
+		if v = strings.Trim(v, " \t\n\v\f\r"); v != "" {
+			cleaned = append(cleaned, v)
+		}
+	}
+	sort.Strings(cleaned)
+	return strings.Join(cleaned, "|")
 }
 
 const (
 	legacyNormVersion  byte = 1
-	currentNormVersion byte = 2
+	v2NormVersion      byte = 2
+	currentNormVersion byte = 3
 )
 
 var legacyFactorNames = []string{
@@ -323,8 +366,17 @@ var legacyFactorNames = []string{
 	"firmware", "gpu_id", "monitor_edid", "os_build",
 }
 
-var currentDirectFactorNames = []string{
+// Schema v2 is historical compatibility code: v2 helpers recover with it.
+var v2DirectFactorNames = []string{
 	"slstore", "machine_guid", "cpu_id", "disk_serial", "ram_total",
+	"volume_id", "firmware", "tpm_ek", "memory_modules", "nic_identity",
+	"battery_serial",
+}
+
+// Schema v3: fixed_disk_serial leaves out removable, USB and image-backed
+// disks, and display_group uses per-monitor EDID digests.
+var currentDirectFactorNames = []string{
+	"slstore", "machine_guid", "cpu_id", "fixed_disk_serial", "ram_total",
 	"volume_id", "firmware", "tpm_ek", "memory_modules", "nic_identity",
 	"battery_serial",
 }
@@ -334,10 +386,27 @@ type factorGroup struct {
 	members []string
 }
 
-var currentFactorGroups = []factorGroup{
+var v2FactorGroups = []factorGroup{
 	{name: "platform_identity", members: []string{"system_uuid", "board_serial", "system_serial", "chassis_serial"}},
 	{name: "display_group", members: []string{"gpu_id", "monitor_edid"}},
 	{name: "software_environment", members: []string{"computer_name", "os_build"}},
+}
+
+var currentFactorGroups = []factorGroup{
+	{name: "platform_identity", members: []string{"system_uuid", "board_serial", "system_serial", "chassis_serial"}},
+	{name: "display_group", members: []string{"gpu_id", "edid_digests"}},
+	{name: "software_environment", members: []string{"computer_name", "os_build"}},
+}
+
+// schema returns the direct names and groups of a grouped schema (v2 or v3).
+func schema(normVersion byte) ([]string, []factorGroup, bool) {
+	switch normVersion {
+	case v2NormVersion:
+		return v2DirectFactorNames, v2FactorGroups, true
+	case currentNormVersion:
+		return currentDirectFactorNames, currentFactorGroups, true
+	}
+	return nil, nil, false
 }
 
 // projectFactors is the single maintenance point for factor-schema changes.
@@ -356,15 +425,16 @@ func projectFactors(raw map[string]string, normVersion byte) (map[string]string,
 		}
 		return out, nil
 	}
-	if normVersion != currentNormVersion {
+	directNames, groups, ok := schema(normVersion)
+	if !ok {
 		return nil, fmt.Errorf("slhwid: unsupported factor schema %d", normVersion)
 	}
-	for _, name := range currentDirectFactorNames {
+	for _, name := range directNames {
 		if value := raw[name]; value != "" {
 			out[name] = value
 		}
 	}
-	for _, group := range currentFactorGroups {
+	for _, group := range groups {
 		if value := groupValue(group, raw); value != "" {
 			out[group.name] = value
 		}
@@ -399,12 +469,14 @@ func currentMandatoryName(name string) string {
 	switch name {
 	case "product_uuid", "board_serial", "system_uuid", "system_serial", "chassis_serial":
 		return "platform_identity"
-	case "gpu_id", "monitor_edid":
+	case "gpu_id", "monitor_edid", "edid_digests":
 		return "display_group"
 	case "computer_name", "os_build":
 		return "software_environment"
 	case "mac":
 		return "nic_identity"
+	case "disk_serial":
+		return "fixed_disk_serial"
 	default:
 		return name
 	}
@@ -601,7 +673,7 @@ func parseHelper(blob []byte) (*helperData, error) {
 	if body[0] != 1 {
 		return nil, fmt.Errorf("%w: unsupported version %d", ErrCorruptHelper, body[0])
 	}
-	if body[1] != legacyNormVersion && body[1] != currentNormVersion {
+	if body[1] != legacyNormVersion && body[1] != v2NormVersion && body[1] != currentNormVersion {
 		return nil, fmt.Errorf("%w: unsupported factor schema %d", ErrCorruptHelper, body[1])
 	}
 	if body[6] != 0 || body[7] != 0 {
@@ -613,10 +685,11 @@ func parseHelper(blob []byte) (*helperData, error) {
 			allowed[name] = true
 		}
 	} else {
-		for _, name := range currentDirectFactorNames {
+		directNames, groups, _ := schema(body[1])
+		for _, name := range directNames {
 			allowed[name] = true
 		}
-		for _, group := range currentFactorGroups {
+		for _, group := range groups {
 			allowed[group.name] = true
 		}
 	}

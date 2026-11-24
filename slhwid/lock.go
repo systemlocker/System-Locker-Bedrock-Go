@@ -31,6 +31,7 @@ func acquireStorageLock(directory string) (func(), error) {
 	}
 	contents := lockHeader + "\n" + strconv.Itoa(os.Getpid()) + "\n" + fmt.Sprintf("%x", token) + "\n"
 	deadline := time.Now().Add(lockWait)
+	deniedAttempts := 0
 
 	for {
 		file, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -45,6 +46,14 @@ func acquireStorageLock(directory string) (func(), error) {
 				return nil, fmt.Errorf("slhwid: storage lock close failed: %w", closeErr)
 			}
 			return func() { removeLockIfUnchanged(lockPath, contents) }, nil
+		}
+		// Windows reports a marker that another process is deleting as
+		// "access denied" instead of "exists". That state lasts
+		// milliseconds; a persistent denial is a real permission error.
+		if os.IsPermission(err) && deniedAttempts < 20 {
+			deniedAttempts++
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 		if !os.IsExist(err) {
 			return nil, fmt.Errorf("slhwid: cannot acquire storage lock: %w", err)
@@ -64,9 +73,21 @@ func acquireStorageLock(directory string) (func(), error) {
 }
 
 func removeLockIfUnchanged(path, expected string) {
-	data, err := os.ReadFile(path)
-	if err == nil && string(data) == expected {
-		_ = os.Remove(path)
+	// On Windows, deleting fails while another process is reading the
+	// marker. Giving up would leave a marker that blocks every caller for the
+	// grace period, so retry briefly; the contents check stops if it changed.
+	for attempt := 0; attempt < 20; attempt++ {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return
+			}
+		} else if string(data) != expected {
+			return
+		} else if err := os.Remove(path); err == nil || os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

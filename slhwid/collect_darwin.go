@@ -1,4 +1,4 @@
-// collect_darwin.go gathers the §4A.1 factor slots on macOS through the
+// collect_darwin.go gathers the SL-HWID factor slots on macOS through the
 // system command-line tools, keeping the library dependency-free. Every
 // source degrades gracefully; slow tools (system_profiler) run under a hard
 // timeout and simply leave their slot absent when they miss it.
@@ -8,7 +8,6 @@ package slhwid
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 )
@@ -52,8 +51,7 @@ func Collect() (map[string]string, error) {
 	}
 	if out, err := runCmd(3*time.Second, "networksetup", "-listallhardwareports"); err == nil {
 		if addresses := allMatches(`(?i)Ethernet Address:\s*([0-9a-f:]{17})`, out); len(addresses) > 0 {
-			sort.Strings(addresses)
-			factors["nic_identity"] = strings.Join(addresses, "|")
+			factors["nic_identity"] = joinInstances(addresses)
 		}
 	}
 
@@ -86,8 +84,7 @@ func Collect() (map[string]string, error) {
 	}
 	if out, err := runCmd(5*time.Second, "system_profiler", "SPMemoryDataType", "-json"); err == nil {
 		if serials := allMatches(`"[^"]*serial[^"]*"\s*:\s*"([^"]+)"`, out); len(serials) > 0 {
-			sort.Strings(serials)
-			factors["memory_modules"] = strings.Join(serials, "|")
+			factors["memory_modules"] = joinInstances(serials)
 		}
 	}
 	if out, err := runCmd(3*time.Second, "ioreg", "-r", "-c", "AppleSmartBattery"); err == nil {
@@ -100,11 +97,10 @@ func Collect() (map[string]string, error) {
 		}
 	}
 
-	// gpu_id: every display model, sorted (§4A.1 multi-instance form).
+	// gpu_id: every display model, sorted (multi-instance form).
 	if out, err := runCmd(5*time.Second, "system_profiler", "SPDisplaysDataType", "-json"); err == nil {
 		if models := allMatches(`"spdisplays_model"\s*:\s*"([^"]+)"`, out); len(models) > 0 {
-			sort.Strings(models)
-			factors["gpu_id"] = strings.Join(models, "|")
+			factors["gpu_id"] = joinInstances(models)
 		}
 	}
 
@@ -112,16 +108,27 @@ func Collect() (map[string]string, error) {
 	// name varies by transport, so any serial-ish key is accepted).
 	if out, err := runCmd(5*time.Second, "system_profiler", "SPStorageDataType", "-json"); err == nil {
 		if serials := allMatches(`"[a-z_]*serial[a-z_]*"\s*:\s*"([^"]+)"`, out); len(serials) > 0 {
-			sort.Strings(serials)
-			factors["disk_serial"] = strings.Join(serials, "|")
+			factors["disk_serial"] = joinInstances(serials)
+		}
+	}
+
+	// fixed_disk_serial (schema v3): only internal NVMe/SATA buses are listed
+	// here; USB storage appears under SPUSBDataType instead.
+	if out, err := runCmd(5*time.Second, "system_profiler", "SPNVMeDataType", "SPSerialATADataType", "-json"); err == nil {
+		if serials := allMatches(`"device_serial"\s*:\s*"([^"]+)"`, out); len(serials) > 0 {
+			if v := joinInstances(serials); v != "" {
+				factors["fixed_disk_serial"] = v
+			}
 		}
 	}
 
 	// monitor_edid: EDID hex blobs from IOKit.
 	if out, err := runCmd(3*time.Second, "ioreg", "-r", "-c", "IODisplayConnect"); err == nil {
 		if blobs := allMatches(`"IODisplayEDID"\s*=\s*<?([0-9a-fA-F]+)>?`, out); len(blobs) > 0 {
-			sort.Strings(blobs)
-			factors["monitor_edid"] = strings.ToLower(strings.Join(blobs, "|"))
+			for i := range blobs {
+				blobs[i] = strings.ToLower(blobs[i]) // lowercase before sorting, as the other implementations do
+			}
+			factors["monitor_edid"] = joinInstances(blobs)
 		}
 	}
 

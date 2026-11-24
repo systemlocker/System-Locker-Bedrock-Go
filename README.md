@@ -13,8 +13,11 @@ may fit better (see the System Locker Simple libraries).
 ## Install
 
 ```sh
-go get github.com/systemlocker/system-locker-bedrock-go
+go get github.com/systemlocker/system-locker-bedrock-go/v2@v2.0.0
 ```
+
+Upgrading from v1: add `/v2` to the module path in your imports, before any
+subpackage such as `/hwid` or `/slhwid`.
 
 No third-party dependencies — standard library only.
 
@@ -27,7 +30,7 @@ import (
     "context"
     "fmt"
 
-    bedrock "github.com/systemlocker/system-locker-bedrock-go"
+    bedrock "github.com/systemlocker/system-locker-bedrock-go/v2"
 )
 
 func main() {
@@ -130,7 +133,7 @@ The library derives a hardware ID by default; set `Config.HWID = "1"` only to
 explicitly disable device locking.
 
 ```go
-import "github.com/systemlocker/system-locker-bedrock-go/hwid"
+import "github.com/systemlocker/system-locker-bedrock-go/v2/hwid"
 
 device, err := hwid.DeviceHWID()
 ```

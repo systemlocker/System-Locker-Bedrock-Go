@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	bedrock "github.com/systemlocker/system-locker-bedrock-go"
+	bedrock "github.com/systemlocker/system-locker-bedrock-go/v2"
 )
 
 func main() {

@@ -1,4 +1,4 @@
-// collect_windows.go gathers the §4A.1 factor slots on Windows. The legacy
+// collect_windows.go gathers the SL-HWID factor slots on Windows. The legacy
 // slots reuse the shared hwid collector; the extended slots come from the
 // registry, environment, and best-effort CIM queries (a missing source just
 // leaves the slot absent — the threshold scheme absorbs it).
@@ -8,29 +8,19 @@ package slhwid
 
 import (
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/systemlocker/system-locker-bedrock-go/hwid"
+	"github.com/systemlocker/system-locker-bedrock-go/v2/hwid"
 )
 
 // displayClassGUID is the Windows device setup class for display adapters.
 const displayClassGUID = `{4d36e968-e325-11ce-bfc1-08002be10318}`
 
 // multiInstance joins per-instance values in sorted order with "|" — the
-// canonical multi-instance factor form (§4A.1).
-func multiInstance(values []string) string {
-	cleaned := make([]string, 0, len(values))
-	for _, v := range values {
-		if v != "" {
-			cleaned = append(cleaned, v)
-		}
-	}
-	sort.Strings(cleaned)
-	return strings.Join(cleaned, "|")
-}
+// canonical multi-instance factor form.
+func multiInstance(values []string) string { return joinInstances(values) }
 
 // regTypedValue reads one value of any common type, returning the value
 // column as text (multi-string values arrive space-joined on one line).
@@ -78,13 +68,23 @@ func regValuesRecursive(path, name string) []string {
 // cimFactors gathers the newer schema-v2 signals in one PowerShell process.
 // It is enrichment only: native values are never replaced by CIM results.
 func cimFactors() map[string]string {
-	const script = "$ErrorActionPreference='SilentlyContinue';" +
+	// UTF-8 output keeps non-ASCII hardware strings identical to the other
+	// implementations, which set the same encoding.
+	const script = "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;$ErrorActionPreference='SilentlyContinue';" +
 		"function Emit($n,$v){$c=@($v|Where-Object{$_ -ne $null -and ([string]$_).Trim().Length -gt 0}|ForEach-Object{([string]$_).Trim()}|Sort-Object);if($c.Count -gt 0){Write-Output ($n+'='+($c -join '|'))}};" +
 		"$p=Get-CimInstance Win32_ComputerSystemProduct;Emit 'system_uuid' $p.UUID;Emit 'system_serial' $p.IdentifyingNumber;" +
 		"Emit 'chassis_serial' (Get-CimInstance Win32_SystemEnclosure).SerialNumber;" +
 		"Emit 'disk_serial' (Get-CimInstance Win32_DiskDrive).SerialNumber;" +
+		// Schema v3 fixed disks leave out USB (7), SD (12), MMC (13) and
+		// mounted images (15), as Windows' STORAGE_BUS_TYPE numbers them.
+		"Emit 'fixed_disk_serial' (Get-CimInstance -Namespace root/Microsoft/Windows/Storage MSFT_PhysicalDisk|?{$_.BusType -notin 7,12,13,15}).SerialNumber;" +
 		"Emit 'memory_modules' (Get-CimInstance Win32_PhysicalMemory).SerialNumber;" +
-		"Emit 'nic_identity' (Get-CimInstance Win32_NetworkAdapter|Where-Object{$_.PhysicalAdapter}).PermanentAddress;" +
+		// Win32_NetworkAdapter.PermanentAddress is normally empty. It stays
+		// first so any value it did provide keeps its enrolled form;
+		// MSFT_NetAdapter supplies it otherwise.
+		"$n=@((Get-CimInstance Win32_NetworkAdapter|?{$_.PhysicalAdapter}).PermanentAddress|?{$_});" +
+		"if($n.Count -eq 0){$n=(Get-CimInstance -Namespace root/StandardCimv2 MSFT_NetAdapter|?{$_.ConnectorPresent -and -not $_.Virtual}).PermanentAddress};" +
+		"Emit 'nic_identity' $n;" +
 		"Emit 'battery_serial' (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData).SerialNumber;" +
 		"$ek=Get-TpmEndorsementKeyInfo -HashAlgorithm Sha256;if($ek.IsPresent){Emit 'tpm_ek' $ek.PublicKeyHash}"
 	out, err := runCmd(12*time.Second, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
@@ -93,7 +93,7 @@ func cimFactors() map[string]string {
 	}
 	known := map[string]bool{
 		"system_uuid": true, "system_serial": true, "chassis_serial": true,
-		"disk_serial": true, "memory_modules": true, "nic_identity": true,
+		"disk_serial": true, "fixed_disk_serial": true, "memory_modules": true, "nic_identity": true,
 		"battery_serial": true, "tpm_ek": true,
 	}
 	factors := map[string]string{}
@@ -106,7 +106,7 @@ func cimFactors() map[string]string {
 	return factors
 }
 
-// Collect gathers the available §4A factor slots on Windows. Missing
+// Collect gathers the available SL-HWID factor slots on Windows. Missing
 // optional slots degrade gracefully; the legacy collector's fail-closed
 // machine GUID simply leaves that slot absent for this module.
 func Collect() (map[string]string, error) {

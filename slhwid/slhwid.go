@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -144,7 +145,7 @@ func prepareWith(opts Options, collect func() (map[string]string, error), rng io
 		// Enrollment creates the persisted store secret before any share
 		// exists.
 		if rawFactors["slstore"] == "" {
-			value, err := ensureSlstore(st, rng)
+			value, err := ensureSlstore(st, rng, opts.ForceReenroll)
 			if err != nil {
 				return nil, err
 			}
@@ -352,14 +353,20 @@ func (s *Session) wipeSecret() {
 
 // ensureSlstore loads the persisted store secret or creates it. The returned
 // factor value is the lowercase hex of the 32 random bytes.
-func ensureSlstore(st store, rng io.Reader) (string, error) {
+// ensureSlstore runs only on the enrollment path (no helper, or
+// ForceReenroll). A malformed secret is never replaced implicitly, but an
+// explicit ForceReenroll discards it with the rest of the device state;
+// refusing that too would leave no recovery path short of deleting the
+// store by hand.
+func ensureSlstore(st store, rng io.Reader, forceReenroll bool) (string, error) {
 	if value, found, err := st.ReadSlstore(); err != nil {
-		return "", fmt.Errorf("slhwid: store secret read failed: %w", err)
-	} else if found {
-		if len(value) != 32 {
-			return "", fmt.Errorf("%w: store secret has the wrong size", ErrCorruptHelper)
+		if !forceReenroll || !errors.Is(err, ErrCorruptHelper) {
+			return "", fmt.Errorf("slhwid: store secret read failed: %w", err)
 		}
+	} else if found && len(value) == 32 {
 		return hex.EncodeToString(value), nil
+	} else if found && !forceReenroll {
+		return "", fmt.Errorf("%w: store secret has the wrong size", ErrCorruptHelper)
 	}
 	value := make([]byte, 32)
 	if _, err := io.ReadFull(rng, value); err != nil {

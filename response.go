@@ -35,9 +35,11 @@ const (
 	CodeSigningKeyRevoked
 	CodeConcurrentHeartbeat
 	CodeInternalError
+	CodeNightflyerLeaseActive
 )
 
 var codeNames = map[ResponseCode]string{
+	CodeNightflyerLeaseActive:     "NIGHTFLYER_LEASE_ACTIVE",
 	CodeOK:                        "OK",
 	CodeOutdated:                  "OUTDATED",
 	CodeMissingField:              "MISSING_FIELD",

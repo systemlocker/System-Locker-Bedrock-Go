@@ -6,6 +6,7 @@
 package slhwid
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"os/exec"
@@ -103,12 +104,10 @@ func (s *registryStore) selectRoot(helperName string) (string, error) {
 		return s.selectedRoot, nil
 	}
 	lmStore, lmStoreFound, err := regReadBinary(regRootHKLM, slstoreName)
-	_ = lmStore
 	if err != nil {
 		return "", err
 	}
 	cuStore, cuStoreFound, err := regReadBinary(regRootHKCU, slstoreName)
-	_ = cuStore
 	if err != nil {
 		return "", err
 	}
@@ -123,10 +122,21 @@ func (s *registryStore) selectRoot(helperName string) (string, error) {
 			return "", err
 		}
 	}
+	// Only a well-formed secret completes a generation: a malformed HKLM
+	// secret that a non-elevated ForceReenroll could not overwrite must not
+	// outrank the replacement it wrote to HKCU.
+	lmValid := lmStoreFound && wellFormedSlstore(lmStore)
+	cuValid := cuStoreFound && wellFormedSlstore(cuStore)
+	// A user hive holding the machine's own secret is a per-user copy of the
+	// machine generation (same key and HWID) written by a process that
+	// cannot update HKLM. That copy is the one this user can keep refreshed.
+	mirror := lmValid && cuValid && bytes.Equal(lmStore, cuStore)
 	switch {
-	case helperName != "" && lmHelperFound && lmStoreFound || helperName == "" && lmStoreFound:
+	case mirror && (helperName == "" || lmHelperFound && cuHelperFound):
+		s.selectedRoot = regRootHKCU
+	case helperName != "" && lmHelperFound && lmValid || helperName == "" && lmValid:
 		s.selectedRoot = regRootHKLM
-	case helperName != "" && cuHelperFound && cuStoreFound || helperName == "" && cuStoreFound:
+	case helperName != "" && cuHelperFound && cuValid || helperName == "" && cuValid:
 		s.selectedRoot = regRootHKCU
 	case lmHelperFound || lmStoreFound:
 		s.selectedRoot = regRootHKLM
@@ -142,7 +152,25 @@ func (s *registryStore) writePinned(name string, data []byte) error {
 		return err
 	}
 	if root != "" {
-		return regWriteBinary(root, name, data)
+		err := regWriteBinary(root, name, data)
+		if err == nil || root != regRootHKLM {
+			return err
+		}
+		// A non-elevated process cannot update an HKLM generation that an
+		// elevated one created. Continue in HKCU instead of never absorbing
+		// drift again: copying the machine secret first makes the user hive
+		// a complete mirror with the same key, so the HWID is kept.
+		if name != slstoreName {
+			secret, found, readErr := regReadBinary(regRootHKLM, slstoreName)
+			if readErr != nil || !found || regWriteBinary(regRootHKCU, slstoreName, secret) != nil {
+				return err
+			}
+		}
+		if regWriteBinary(regRootHKCU, name, data) != nil {
+			return err
+		}
+		s.selectedRoot = regRootHKCU
+		return nil
 	}
 	if err := regWriteBinary(regRootHKLM, name, data); err == nil {
 		s.selectedRoot = regRootHKLM
@@ -154,6 +182,10 @@ func (s *registryStore) writePinned(name string, data []byte) error {
 	} else {
 		return err
 	}
+}
+
+func wellFormedSlstore(data []byte) bool {
+	return len(data) == len(slstorePrefix)+32 && bytes.HasPrefix(data, slstorePrefix)
 }
 
 func (s *registryStore) ReadSlstore() ([]byte, bool, error) {
